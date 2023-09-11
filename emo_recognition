@@ -1,0 +1,63 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time    : 2023/4/19 10:24
+# @Author  : ykjiang2
+# @Email   : ykjiang2@iflytek.com
+# @File    : exp4 facial_expression_recognition.py
+from Ktool.face_tool import FaceDetector
+from Ktool.video_tool import read_capture_show
+from calc_emo import cal_static_face_au, cal_dynamics_face_au, au2emotion, time_conut
+import dlib, cv2
+# 加载 dlib 的预训练人脸检测器和关键点检测器
+# 加载 dlib 的预训练人脸检测器和关键点检测器
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(r"C:\Users\ykjiang2\PycharmProjects\FER_iflytek\corecode\ktool\shape_predictor_68_face_landmarks.dat")
+
+def a(img):
+    # 转换为灰度图像
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 在灰度图像上检测人脸
+    rects = detector(gray, 0)
+    # 遍历检测到的人脸
+    print(rects)
+    for rect in rects:
+        # 使用关键点检测器定位人脸关键点
+        shape = predictor(gray, rect)
+        # 遍历每个关键点并在图像上绘制一个圆圈
+        for i in range(68):
+            x, y = shape.part(i).x, shape.part(i).y
+            cv2.circle(img, (x, y), 2, (0, 0, 255), -1)
+    return img
+class Solution:
+    def __init__(self) -> None:
+        '''
+        心率检测类
+        self.FD: 人脸检测类
+        self.have_face: 人脸检测状态记录
+        self.P: 心率计算类
+        '''
+        self.FD = FaceDetector('box')
+        self.head_angle = (0,0,0)
+        self.brow_flow_avg, self.brow_high_avg = 0, 0
+        self.face_emotion_list = []
+
+    def forward(self, image):
+        face_landmarks, face_boxes = self.FD.get_landmarks_openface(image)
+        if face_landmarks is not None:
+            static_face_au = cal_static_face_au(face_landmarks, face_boxes)
+            dynamics_face_au, self.brow_high_avg, self.brow_flow_avg, head_angle_speed, self.head_angle \
+                = cal_dynamics_face_au(face_landmarks, face_boxes, self.head_angle,
+                                       self.brow_high_avg, self.brow_flow_avg)
+            face_feature = static_face_au.copy()
+            face_feature.update(dynamics_face_au)
+            face_emotion = au2emotion(face_feature)
+            if head_angle_speed[0] * 4 + head_angle_speed[1] + head_angle_speed[2] > 20:
+                face_emotion = 'head speed up'
+            self.face_emotion_list, face_emotion_final = time_conut(face_emotion, self.face_emotion_list)
+            image = self.FD.draw_img(image, face_boxes, face_landmarks, face_emotion_final)
+        return image
+
+
+if __name__ == "__main__":
+    # read_capture_show(a)
+    read_capture_show('', Solution().forward)
