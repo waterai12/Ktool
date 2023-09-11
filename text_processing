@@ -1,0 +1,38 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time    : 2023/5/16 13:50
+# @Author  : ykjiang2
+# @Email   : ykjiang2@iflytek.com
+# @File    : text_processing.py
+import re
+import json
+
+
+def data_preprocess(line):
+    ## 特殊操作文本
+    new_line = []
+    for char in list(line):
+        new_line.append(char)
+    new_line = "".join(new_line)
+    punct = ' |、|。|;|；|，|,|:|：|!|！|\?|？|＃|＄|＆|＊|［|］|＾|｛|｝|「」|『』|【】|〖〗|〘〙|〚〛|〰|〾|〿|\'|\\|\"|🈚️|🈶️|👀|😭|👌|➕'
+    splits = re.split(punct, new_line.strip())
+    line = ''.join(splits)
+    new_line = line.lower()
+    return new_line
+
+
+def txt2json_text(text):
+    '''
+    处理GPT返回的数据，对其进行格式化和清洗处理
+    :param text:
+    :return:
+    '''
+    text = text.replace('\'', '\"').replace('：', ':').replace('，', ',')\
+        .replace("```", '').replace("- ", '').replace("\n\n", '\n')
+    pattern = r'{.*?}' # {[\s\S]*}
+    matches = re.findall(pattern, text, re.DOTALL)
+    text = matches[0] if matches else ''
+    if text=='':
+        print('回复不完成')
+    # print('dict:', json.loads(text))
+    return json.dumps(json.loads(text), indent=4, ensure_ascii=False)
