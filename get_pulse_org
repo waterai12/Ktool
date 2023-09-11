@@ -1,0 +1,480 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time    : 2023/5/9 11:08
+# @Author  : ykjiang2
+# @Email   : ykjiang2@iflytek.com
+# @File    : get_pulse_org.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time    : 2023/4/27 14:42
+# @Author  : ykjiang2
+# @Email   : ykjiang2@iflytek.com
+# @File    : get_pulse.py
+import numpy as np
+import cv2
+from scipy import signal
+import time
+from Ktool.face_tool import FaceDetector
+from Ktool.file_tool import write_txt_list
+
+class GetPulse:
+    def __init__(self) -> None:
+        self.update_idx = 0
+        self.state_list, self.signal_list, self.time_list = [], [], []
+        self.DEBUG_MODE = False
+        self.MIN_HZ = 0.83  # 50 BPM - minimum allowed heart rate
+        self.MAX_HZ = 3.33  # 200 BPM - maximum allowed heart rate
+        self.last_bpm = 0
+        self.MAX_VALUES_TO_GRAPH = 50
+        self.BUFFER_MAX_SIZE = 200+30*4  # 320
+        self.MIN_pulse_len = 120
+        self.MAX_pulse_len = 30*7  # 210
+
+
+    def collecting_signal(self, img, face_landmarks, current_state):
+        # # TODO 根据人脸关键点提取脸部轮廓
+        # face_outline = self.get_face_outline(face_landmarks)
+        # TODO 根据人脸关键点提取感兴趣区域
+        roi_box = self.get_roi_box(face_landmarks)
+        self.state_list, self.signal_list, self.time_list = self.signal_sequence_preprocessing(img, roi_box, current_state)
+        return self.state_list, self.signal_list, self.time_list, roi_box
+
+    def signal_sequence_preprocessing(self, img, landmark_box, current_state):
+        '''
+        时序信号处理: 根据人脸轮廓和状态，采集人脸区域像素均值，并记录到250帧信号序列中，同步记录250帧的状态序列，和时间序列
+        :param img:原始图像
+        :param roi_box:根据关键点选取的人脸感兴趣区域
+        :param current_state: 状态[-1:无人脸，0:人脸运动过速, 1:适合检测人脸]
+        :return: 250帧人脸区域像素均值序列，以及对应的状态序列，和时间序列
+        '''
+        self.state_list.append(current_state)
+        self.time_list.append(time.time())
+        # 通过人脸轮廓计算人脸区域的像素均值
+        self.signal_list.append(self.calc_face_mean(img, landmark_box, current_state))
+        if len(self.state_list) > self.BUFFER_MAX_SIZE:
+            self.state_list.pop(0)
+            self.signal_list.pop(0)
+            self.time_list.pop(0)
+        return self.state_list, self.signal_list, self.time_list
+
+    def get_roi_box(self, landmarks):
+        '''
+        根据人脸关键点，选取感兴趣区域box, 可随距离自适应区域大小
+        :param landmarks: (68, 2)
+        :return: box_list[box1, box2]
+        '''
+        if landmarks is None:
+            return [[0,0,0,0]]
+        # box1_h, box1_w, box2_h, box2_w = 40, 80, 50, 120
+        S_y = landmarks.parts()[30].y-landmarks.parts()[28].y
+        S_x = landmarks.parts()[26].x-landmarks.parts()[17].x
+        box1_h,box2_h=S_y*1.2, S_y
+        box1_w, box2_w = S_x*0.6, S_x*0.8
+        x1 = landmarks.parts()[21].x+landmarks.parts()[22].x
+        y1 = landmarks.parts()[21].y+landmarks.parts()[22].y
+        if x1>box1_w and y1>box1_h*2:
+            box1 = [int((x1-box1_w)/2), int(y1/2)-int(box1_h), int(box1_w), int(box1_h)]
+        else:
+            box1 = [0,0,0,0]
+        x2 = landmarks.parts()[29].x+landmarks.parts()[29].x
+        y2 = landmarks.parts()[29].y+landmarks.parts()[29].y
+        if x2>box2_w or y2 >box2_h:
+            box2 = [int((x2-box2_w)/2), int((y2-box2_h)/2), int(box2_w), int(box2_h)]
+        else:
+            box2=[0,0,0,0]
+        return [box1, box2]
+
+    def calc_face_mean(self, image, roi_box, current_state):
+        if current_state>1:
+            val = np.mean([self.get_subface_means(image, box) for box in roi_box])
+        else:
+            val = 0
+        return val
+
+    def get_subface_means(self, img, box):
+        '''
+        description: 获取box中图像的RGB均值，是计算心率的数据依据。
+        param: img-图像，box-box坐标。
+        return: v1是B通道，v2是G通道，v3是R通道。
+        '''
+        x, y, w, h = box
+        img_box = img[y:y + h, x:x + w, :]
+        v1 = np.mean(img_box[:, :, 0])
+        v2 = np.mean(img_box[:, :, 1])
+        v3 = np.mean(img_box[:, :, 2])
+        # return (v1 + v2 + v3) / 3.
+        return v2
+
+    def find_effective_state(self, have_face, have_pixel_mean, have_time):
+        idx_start, idx_end = self.max_consecutive_ones(have_face)
+        curr_buffer_size = idx_end - idx_start + 1  # 当前有效数据帧数
+        if (curr_buffer_size > self.MIN_pulse_len):
+            # 计算这一段数据帧一共花费时间 和 每秒帧数
+            time_elapsed = have_time[idx_end] - have_time[idx_start]
+            fps = (curr_buffer_size) / time_elapsed
+            value = have_pixel_mean[idx_start:idx_end + 1]
+        else:
+            fps, value = 0, []
+        return value, fps#, curr_buffer_size
+
+    def find_effective_state1(self, state_list, signal_list, time_list):
+        '''
+        从信号序列中寻找有效信号，并计算有效信号的fps，返回有效信号段
+        :param state_list: 状态序列[2222222221111111111111110000000]
+        :param have_pixel_mean: 信号序列[77777777777777777000000000000000000]
+        :param have_time: 时间序列[]
+        :return: values ，返回有效信号段，以及fps值
+        '''
+        if state_list.count(2)>60:
+            start, end, time_elapsed = None, None, 0
+            vaild_pair_idx = []
+            for i, x in enumerate(state_list):
+                if x == 2:
+                    if start is None:
+                        start = i
+                    end = i
+                elif start is not None:
+                    vaild_pair_idx.append((start, end))
+                    start = None
+                    end = None
+
+            if start is not None:
+                vaild_pair_idx.append((start, end))
+            value = []
+            for start, end in vaild_pair_idx:
+                value += signal_list[start:end + 1]
+                time_elapsed += time_list[end]-time_list[start]
+            fps = (len(value)) / time_elapsed
+            if len(value)>=self.MAX_pulse_len:
+                return value[-self.MAX_pulse_len:], fps
+            else:
+                return value, fps
+        else:
+            return [], 0
+
+    def max_consecutive_ones(self, nums):
+        '''
+        :description: 找have_face有效段的起止下标。
+        :param num: have_face数组
+        :return: 数组中最长连续1的起始位置和结束位置
+        '''
+        max_len = 0  # 最长连续1的长度
+        start, end = 0, 0  # 最长连续1的起始位置和结束位置
+        cur_start = 0  # 当前连续1的起始位置
+
+        for i in range(len(nums)):
+            if nums[i] == 0:
+                # 更新最长连续1的长度和起始位置
+                if i - cur_start > max_len:
+                    max_len = i - cur_start
+                    start, end = cur_start, i - 1
+                cur_start = i + 1  # 更新当前连续1的起始位置
+
+        # 处理最后一个连续的1
+        if len(nums) - cur_start > max_len:
+            max_len = len(nums) - cur_start
+            start, end = cur_start, len(nums) - 1
+
+        return start, end
+
+    def get_face_outline(self, landmarks):
+        if landmarks is None:
+            return landmarks
+        # 从landmarks中获取面部轮廓的点
+        list_face = []
+        for p in landmarks.parts()[:17]:
+            list_face.append((p.x, p.y))
+        list_face.append((landmarks.parts()[28].x, landmarks.parts()[28].y))
+        face_outline = np.array(list_face, dtype=np.int32)
+        # 计算多边形的中心点
+        center = np.mean(face_outline, axis=0)
+        # 计算每个顶点与中心点之间的向量
+        vectors = face_outline - center
+        # 将向量缩小1/6
+        scaled_vectors = vectors * 5 / 6
+        scaled_face_outline = center + scaled_vectors
+        return scaled_face_outline.astype(np.int32)
+
+    def butterworth_filter(self, data, low, high, fps, order=4):
+        '''
+        :description: 巴特沃兹滤波
+        :param data: 帧数据
+        :param low: 带通最低频率
+        :param high: 带通最高频率
+        :param fps: 每秒帧数
+        :param order: 滤波器阶数
+        :return: 返回巴特沃兹滤波后的帧数据
+        '''
+        nyquist_rate = fps * 0.5  # 奈奎斯特速率
+        low /= nyquist_rate
+        high /= nyquist_rate
+        b, a = signal.butter(order, [low, high], btype='band')  # 'band'带通
+        return signal.lfilter(b, a, data)
+
+    def filter_signal_data(self, values, fps):
+        '''
+        :description: 平滑数据、使用滤波器过滤帧数据
+        :param values: 原始帧数据
+        :param fps: 每秒帧数
+        :return: 返回过滤后的帧数据
+        '''
+        # Ensure that array doesn't have infinite or NaN values
+        values = np.array(values)
+        np.nan_to_num(values, copy=False)
+        average = sum(values) / len(values)
+        # Smooth the signal by detrending and demeaning
+        detrended = signal.detrend(values, type='linear')  # 去掉序列的趋势，去趋势后的数据均值为零。
+        demeaned = self.sliding_window_demean(detrended, 15)  # 滑动平均
+        # Filter signal with Butterworth bandpass filter 过滤
+        filtered = self.butterworth_filter(demeaned, self.MIN_HZ, self.MAX_HZ, fps, order=4)
+        return values - average, detrended, demeaned, filtered
+
+    def compute_bpm(self, filtered_values, fps, buffer_size):
+        '''
+        :description: 根据过滤后的帧数据、每秒帧数、数据帧总数，上一帧的心率，计算当前心率。
+        :param filtered_values: 根据过滤后的数据
+        :param fps: 每秒帧数
+        :param buffer_size: 数据帧总数
+        :return: 返回当前心率值
+        '''
+        # Compute FFT
+        fft = np.abs(np.fft.rfft(filtered_values))
+
+        # Generate list of frequencies that correspond to the FFT values生成与FFT值对应的频率列表
+        freqs = fps / buffer_size * np.arange(buffer_size / 2 + 1)
+        # Filter dialog_node any peaks person_dialog the FFT that are not within our range of [MIN_HZ, MAX_HZ]
+        # because they correspond to impossible BPM values.
+        # 过滤掉FFT中不在[MIN_HZ, MAX_HZ]频率范围内的任何峰值，因为它们对应于不可能的BPM值。
+        while True:
+            max_idx = fft.argmax()
+            bps = freqs[max_idx]
+            if bps < self.MIN_HZ or bps > self.MAX_HZ:
+                fft[max_idx] = 0
+            else:
+                bpm = bps * 60.0
+                break
+        print(f'bpm:{bpm}')
+        return bpm
+
+    def sliding_window_demean(self, signal_values, num_windows):
+        '''
+        :description: 滑动平均
+        :param signal_values: 帧数据
+        :param num_windows: 滑动窗口个数
+        :return: 返回滑动平均后的帧数据
+        '''
+        window_size = int(round(len(signal_values) / num_windows))
+        demeaned = np.zeros(signal_values.shape)
+        for i in range(0, len(signal_values), window_size):
+            if i + window_size > len(signal_values):
+                window_size = len(signal_values) - i
+            curr_slice = signal_values[i: i + window_size]
+            if self.DEBUG_MODE and curr_slice.size == 0:
+                print('Empty Slice: size={0}, i={1}, window_size={2}'.format(signal_values.size, i, window_size))
+                print(curr_slice)
+            demeaned[i:i + window_size] = curr_slice - np.mean(curr_slice)
+        return demeaned
+
+    def record_graph(self, filtered):
+        # 记录信号,（四种波形）
+        self.graph_values.append(filtered[-1])
+        if len(self.graph_values) > self.MAX_VALUES_TO_GRAPH:
+            self.graph_values.pop(0)
+            # 绘制波形图
+        graph = self.draw_graph(self.graph_values, self.graph_width, self.graph_height)
+        return graph
+
+    def draw_graph(self, signal_values, graph_width, graph_height):
+        '''
+        :description: 根据滤波后的数据，绘制波形图。
+        :param signal_values: 滤波后的数据
+        :param graph_width: 波形图宽度
+        :param graph_height: 波形图高度
+        :return: 波形图
+        '''
+        graph = np.zeros((graph_height, graph_width, 3), np.uint8)
+        scale_factor_x = float(graph_width) / self.MAX_VALUES_TO_GRAPH
+        # Automatically rescale vertically based on the value with largest absolute value
+        max_abs = max(max(signal_values), -min(signal_values))
+        scale_factor_y = (float(graph_height) / 2.4) / max_abs
+        midpoint_y = graph_height / 2
+        for i in range(0, len(signal_values) - 1):
+            curr_x = int(i * scale_factor_x)
+            curr_y = int(midpoint_y + signal_values[i] * scale_factor_y)
+            next_x = int((i + 1) * scale_factor_x)
+            next_y = int(midpoint_y + signal_values[i + 1] * scale_factor_y)
+            cv2.line(graph, (curr_x, curr_y), (next_x, next_y), color=(0, 255, 0), thickness=2)
+        cv2.putText(graph, f'scale:{scale_factor_y:.1f}', (0, 50), cv2.FONT_HERSHEY_PLAIN, 1, (0, 255, 0))
+        return graph
+
+    def draw_bpm(self, bpm_str, bpm_width, bpm_height, fps):
+        '''
+        :description: 根据心率值，绘制心率值显示图。
+        :param bpm_str: str(心率值)
+        :param bpm_width: 心率值显示图宽度
+        :param bpm_height: 心率值显示图高度
+        :return: 心率值显示图
+        '''
+        bpm_display = np.zeros((bpm_height, bpm_width, 3), np.uint8)
+        bpm_text_size, bpm_text_base = cv2.getTextSize(bpm_str, fontFace=cv2.FONT_HERSHEY_DUPLEX, fontScale=2.7,
+                                                       thickness=2)
+        bpm_text_x = int((bpm_width - bpm_text_size[0]) / 2)
+        bpm_text_y = int(bpm_height / 2 + bpm_text_base)
+        cv2.putText(bpm_display, bpm_str, (bpm_text_x, bpm_text_y), fontFace=cv2.FONT_HERSHEY_DUPLEX,
+                    fontScale=2.7, color=(0, 255, 0), thickness=2)
+        bpm_label_size, bpm_label_base = cv2.getTextSize('BPM', fontFace=cv2.FONT_HERSHEY_DUPLEX, fontScale=0.6,
+                                                         thickness=1)
+        bpm_label_x = int((bpm_width - bpm_label_size[0]) / 2)
+        bpm_label_y = int(bpm_height - bpm_label_size[1] * 2)
+        cv2.putText(bpm_display, 'BPM', (bpm_label_x, bpm_label_y),
+                    fontFace=cv2.FONT_HERSHEY_DUPLEX, fontScale=0.6, color=(0, 255, 0), thickness=1)
+        cv2.putText(bpm_display, f'fps:{fps:.1f}', (0, 50), cv2.FONT_HERSHEY_PLAIN, 1, (0, 255, 0))
+        return bpm_display
+
+    def draw_graph_text(self, text, color, graph_width, graph_height):
+        '''
+        :description: 提示显示
+        :param text: 提示句 or 进度条
+        :param color: 字体颜色
+        :param graph_width: 显示宽度
+        :param graph_height: 显示高度
+        :return: 显示图
+        '''
+        graph = np.zeros((graph_height, graph_width, 3), np.uint8)
+        text_size, text_base = cv2.getTextSize(text, fontFace=cv2.FONT_HERSHEY_DUPLEX, fontScale=1, thickness=1)
+        text_x = int((graph_width - text_size[0]) / 2)
+        text_y = int((graph_height / 2 + text_base))
+        cv2.putText(graph, text, (text_x, text_y), fontFace=cv2.FONT_HERSHEY_DUPLEX, fontScale=1, color=color,
+                    thickness=1)
+        return graph
+
+    def show_total(self, img, graph, bpm_display, segmented_face):
+        segmented_face = segmented_face[:, 80:560, :]
+        img = np.vstack((img[:, ::-1], bpm_display))
+        graph = np.vstack((segmented_face, graph))
+        img = np.hstack((img, graph))
+        return img
+
+
+class Solution:
+    def __init__(self) -> None:
+        '''
+        心率检测类
+        self.FD: 人脸检测类
+        self.have_face: 人脸检测状态记录
+        self.P: 心率计算类
+        '''
+        self.FD = FaceDetector('box')
+        self.GP = GetPulse()
+        self.have_face, self.have_pixel_mean, self.have_time = [], [], []
+        self.current_state = 0
+        self.face_outline = None
+        self.face_landmarks = None
+        self.face_box = [0,0,0,0]
+        self.bpm = 0
+        self.update_idx, self.en = 0, 0
+        self.face_displacement = 400
+
+    def forward(self, img):
+        #-------------------------------------------------------------
+        # Step1: 每过30帧，检测一次当前状态 {人脸静止状态: 2, 人脸运动状态: 1, 无人脸: 0}
+        self.current_state, self.face_landmarks, self.face_box = self.state_detection(img)
+
+        #------------------------------------------------------------------------
+        # Step2: ROI信号采集
+        # 根据人脸轮廓和状态，采集人脸区域像素均值，并记录到250帧信号序列中，同步记录250帧的状态序列，和时间序列
+        state_list, signal_list, time_list, roi_box = self.GP.collecting_signal(img, self.face_landmarks, self.current_state)
+        # print('state:',''.join(str(x) for x person_dialog state_list))
+        # print('pixel:',''.join(str(int(x/25.5)) for x person_dialog signal_list))
+        #------------------------------------------------------------------------
+        # Step3: 时序信号处理
+        # 从信号序列中寻找有效信号，并计算有效信号的fps，返回有效信号段
+        values, fps = self.GP.find_effective_state(state_list, signal_list, time_list)
+
+        #------------------------------------------------------------------------
+        # Step4: 计算心率
+        if len(values)>self.GP.MIN_pulse_len:
+            # print('values:', ''.join(str(int(x)) for x person_dialog values))
+            raw, detrended, demeaned, filtered = self.GP.filter_signal_data(values, fps)
+            # 计算心率
+            self.update_idx += 1
+            if self.update_idx > 30:
+                self.update_idx = 0
+                self.bpm = self.GP.compute_bpm(filtered, fps, len(values))
+                print(values)
+                print('self.bpm:', self.bpm, fps)
+        else:
+            fps, detrended, demeaned, filtered = 0, [], [], []
+
+        print('候选信号:', len(signal_list), (state_list.count(2)), '心率有效值:', len(values), len(filtered))
+        #------------------------------------------------------------------------
+        # Step5: 心率平滑后处理
+        result = {'state': self.current_state,
+                'pct': len(values),
+                'face_landmarks': self.face_landmarks,
+                'face_box': self.face_box,
+                'roi_box': roi_box,
+                'pulse': self.bpm,
+                'fps': fps,
+                'filtered': list(filtered),
+                'signal_list': signal_list,
+                'detrended': detrended,
+                'demeaned': demeaned,
+                'values':values
+        }
+        # img = self.FD.draw_img(img, self.face_box, self.face_landmarks, f'{self.bpm}')
+        # cv2.putText(img, str(self.current_state), (100, 100), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255))
+
+        # for i person_dialog roi_box:
+        #     f_x, f_y, f_w, f_h = i
+        #     cv2.rectangle(img, (f_x, f_y), (f_x + f_w, f_y + f_h), (0, 255, 0), 2)
+        #     cv2.putText(img, "Face", (f_x, f_y), cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0))
+        return result
+
+    def state_detection(self, img):
+        '''
+        :description: 每个30帧，从图像中提取人脸关键点和人脸框，并判断当前状态是否适合检测心率
+                      若人脸移动较慢，适合检测心率，则记录为 2;
+                      若人脸位移较大，不适合检测心率，则记录为 1，将检测到的人脸区域进行更新
+                      若未检测到人脸，不适合检测心率，则记录为 0，将检测到的人脸区域进行更新
+                      返回状态队列;
+        :return: 更新人脸轮廓，人脸框和当前状态
+        '''
+        self.en+=1
+        if self.en>30 or self.en==1: # [2,3,4,5,6,7,8,9,0,1,2,3]
+            self.en=1
+            # 从图像中提取人脸关键点和人脸框
+            new_face_landmarks, self.face_box = self.FD.get_landmarks_openface(img)
+            self.current_state = self.is_face(new_face_landmarks, self.face_landmarks, self.face_displacement)
+            if self.current_state<2:
+                self.face_landmarks = new_face_landmarks
+        return self.current_state, self.face_landmarks, self.face_box
+
+    def is_face(self, new_face_landmarks, face_landmarks, displacement_theshold):
+        '''
+        :description: 检测当前状态是否适合检测心率,
+                      若人脸移动较慢，适合检测心率，则记录为 1;
+                      若人脸位移较大，不适合检测心率，则记录为 0;
+                      若未检测到人脸，不适合检测心率，则记录为 -1;
+        :param new_face_landmarks: 检测到的人脸关键点
+        :param face_landmarks: 上一秒的人脸关键点
+        :param displacement_theshold: 人脸位移差值
+        :return: have_face: 人脸检测状态记录 -1 or 0 or 1
+        '''
+        displacement = self.calc_distance(new_face_landmarks, face_landmarks)
+        print("displacement", displacement)
+        if new_face_landmarks is None:
+            # 若不适合检测心率，则清空所有状态，重新计数
+            return 0
+        elif displacement>displacement_theshold:
+            return 1
+        else:
+            return 2
+
+    def calc_distance(self, new_face_landmarks, face_landmarks):
+        if new_face_landmarks is None or face_landmarks is None:
+            return self.face_displacement+1
+        else:
+            l1 = self.FD.convert_landmarks_np(new_face_landmarks)
+            l2 = self.FD.convert_landmarks_np(face_landmarks)
+            return np.mean((l1-l2)**2)
